@@ -556,17 +556,18 @@ class SourceSyncTest(unittest.TestCase):
                 self.assertEqual(self.module.parse(self.module.render(metadata, body)), (metadata, body))
 
     def test_nested_gate_keys_keep_source_excluded(self):
-        """#179: a privacy or trust key nested under a mapping is never applied, so the
-        source stays out of the index (as before nested mappings were read) instead of
-        being served with the default internal visibility."""
+        """#179: a privacy or trust key nested under a mapping other than the auto-memory
+        `metadata:` is never applied, so the source stays out of the index (as before nested
+        mappings were read) instead of being served with the default internal visibility."""
         cases = [
-            ('metadata:\n  visibility: private', 'visibility'),
-            ('metadata:\n  type: project\n  visibility: public', 'visibility'),
-            ('metadata:\n  trust: untrusted', 'trust'),
-            ('metadata:\n  trusted: false', 'trusted'),
-            ('metadata:\n  remote_allowed: false', 'remote_allowed'),
+            ('facts:\n  visibility: private', 'visibility'),
+            ('custom:\n  type: project\n  visibility: public', 'visibility'),
+            ('facts:\n  trust: untrusted', 'trust'),
+            ('custom:\n  trusted: false', 'trusted'),
+            ('facts:\n  remote_allowed: false', 'remote_allowed'),
             ('metadata:\n  status: untrusted', 'status'),
-            ('metadata:\n  kind: untrusted', 'kind'),
+            ('custom:\n  status: untrusted', 'status'),
+            ('facts:\n  kind: untrusted', 'kind'),
         ]
         source = self.vault / 'nested-gate.md'
         for header, key in cases:
@@ -584,6 +585,62 @@ class SourceSyncTest(unittest.TestCase):
                           '---\nNebula calibration nested gate fixture.\n', encoding='utf-8')
         self.assertEqual(self.engine.sync()['status'], 'succeeded')
         self.assertEqual(self.records()[0]['metadata'], {'status': 'draft', 'kind': 'memory'})
+
+    def write_auto_memory(self, header):
+        """A note as Claude Code auto-memory saves it: custom keys moved under `metadata:`."""
+        source = self.vault / 'auto-memory.md'
+        source.write_text('---\nid: auto-memory\nproject: nebula\n' + header +
+                          '\n---\nNebula calibration auto-memory fixture.\n', encoding='utf-8')
+        return source
+
+    def test_auto_memory_metadata_keys_are_applied(self):
+        """Claude Code auto-memory moves `kind` and `visibility` under `metadata:`. There they
+        are applied like top-level keys instead of excluding the source; a top-level value wins."""
+        self.write_auto_memory('metadata:\n  node_type: memory\n  kind: preference\n  visibility: internal\n'
+                               '  type: feedback\n  modified: 2026-11-12T09:25:43.912Z')
+        report = self.engine.sync()
+        self.assertEqual(report['status'], 'succeeded', report)
+        self.assertEqual(report['warnings'], [])
+        record = self.records()[0]
+        self.assertEqual((record['kind'], record['visibility']), ('preference', 'internal'))
+        self.assertEqual(record['metadata']['type'], 'feedback')
+
+        # A narrowing value is applied, not ignored: the note is no longer served internally.
+        self.write_auto_memory('metadata:\n  kind: fact\n  visibility: private')
+        self.assertEqual(self.engine.sync()['status'], 'succeeded')
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.records(audience='private')[0]['visibility'], 'private')
+        for header in ('metadata:\n  trust: untrusted', 'metadata:\n  trusted: false',
+                       'metadata:\n  kind: untrusted'):
+            with self.subTest(header=header):
+                self.write_auto_memory(header)
+                report = self.engine.sync()
+                self.assertEqual((report['status'], report['warnings']), ('succeeded', []))
+                self.assertEqual(self.records(audience='private'), [])
+
+        # A top-level value wins over the nested one; an equal gate value is accepted.
+        self.write_auto_memory('kind: fact\nmetadata:\n  kind: memory\n  visibility: internal\nvisibility: internal')
+        self.assertEqual(self.engine.sync()['status'], 'succeeded')
+        record = self.records()[0]
+        self.assertEqual((record['kind'], record['visibility']), ('fact', 'internal'))
+
+    def test_auto_memory_gate_conflict_keeps_source_excluded(self):
+        """A nested gate that disagrees with the top-level value is never resolved silently."""
+        cases = [
+            ('visibility: internal\nmetadata:\n  visibility: private', 'visibility'),
+            ('metadata:\n  visibility: private\nvisibility: internal', 'visibility'),
+            ('trust: trusted\nmetadata:\n  trust: untrusted', 'trust'),
+            ('kind: fact\nmetadata:\n  kind: untrusted', 'kind'),
+        ]
+        for header, key in cases:
+            with self.subTest(header=header):
+                source = self.write_auto_memory(header)
+                with self.assertRaisesRegex(ValueError, 'nested ' + key + ' conflicts with top-level'):
+                    self.module.parse(source.read_text(encoding='utf-8'))
+                report = self.engine.sync()
+                self.assertEqual(report['status'], 'degraded', report)
+                self.assertEqual([w['source'] for w in report['warnings']], ['auto-memory.md'])
+                self.assertEqual(self.records(audience='private'), [])
 
     def test_nested_mapping_crlf_and_turkish_keys(self):
         source = self.vault / 'crlf.md'
