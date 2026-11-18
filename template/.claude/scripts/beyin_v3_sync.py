@@ -180,16 +180,39 @@ def _parse_yaml_value(value):
 # stays excluded with a warning, as before nested mappings were read (#179).
 GATE_KEYS = ('visibility', 'trust', 'trusted', 'remote_allowed')
 COMMA_LIST_KEYS = ('tags', 'aliases')
+# Claude Code auto-memory rewrites a note's frontmatter and moves the keys it does not
+# own (e.g. `kind`, `visibility`) under its `metadata:` mapping. Under that one mapping
+# these keys are lifted to the top level, so they are applied instead of ignored: a
+# top-level value wins, and a different gate value keeps the source excluded.
+AUTO_MEMORY_MAPPING = 'metadata'
+LIFTED_KEYS = GATE_KEYS + ('kind',)
 
 
-def _mapping_value(sub_key, value):
+def _mapping_value(sub_key, value, lifted=False):
     """One `key: value` line of a single-level nested mapping."""
     parsed = _parse_yaml_value(value)
     if isinstance(parsed, dict):
         raise ValueError('unsupported YAML metadata; use JSON frontmatter')
+    if lifted and sub_key in LIFTED_KEYS:
+        return parsed
     if sub_key in GATE_KEYS or (sub_key in ('status', 'kind') and parsed == 'untrusted'):
         raise ValueError(f'nested {sub_key} is not applied; move it to top-level frontmatter')
     return parsed
+
+
+def _lift_auto_memory_keys(metadata):
+    """Apply the gate keys and `kind` that Claude Code auto-memory nested under `metadata:`."""
+    mapping = metadata.get(AUTO_MEMORY_MAPPING)
+    if not isinstance(mapping, dict):
+        return
+    for key in LIFTED_KEYS:
+        if key not in mapping:
+            continue
+        nested = mapping[key]
+        if key not in metadata:
+            metadata[key] = nested
+        elif metadata[key] != nested and (key in GATE_KEYS or 'untrusted' in (metadata[key], nested)):
+            raise ValueError(f'nested {key} conflicts with top-level {key}; keep one value')
 
 
 def parse(text):
@@ -240,7 +263,8 @@ def parse(text):
                     elif map_match:
                         mode = 'mapping'
                         indent = map_match[1]
-                        mapping[map_match[2]] = _mapping_value(map_match[2], map_match[3])
+                        mapping[map_match[2]] = _mapping_value(map_match[2], map_match[3],
+                                                               key == AUTO_MEMORY_MAPPING)
                     else:
                         raise ValueError('unsupported YAML metadata; use JSON frontmatter')
                 elif mode == 'list':
@@ -255,7 +279,7 @@ def parse(text):
                     map_match = re.fullmatch(r'([^\W\d][\w-]*):[ \t]*(.*)', cur[len(indent):])
                     if not map_match or map_match[1] in mapping:
                         raise ValueError('unsupported YAML metadata; use JSON frontmatter')
-                    mapping[map_match[1]] = _mapping_value(*map_match.groups())
+                    mapping[map_match[1]] = _mapping_value(*map_match.groups(), key == AUTO_MEMORY_MAPPING)
                 index += 1
             if mode == 'list':
                 metadata[key] = items
@@ -273,6 +297,7 @@ def parse(text):
             if len(items) > 1:
                 parsed = items
         metadata[key] = parsed
+    _lift_auto_memory_keys(metadata)
     return metadata, body
 
 
